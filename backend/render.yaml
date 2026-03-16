@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: spotter-eld-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: ALLOWED_HOSTS
+        value: spotter-eld-backend.onrender.com
+      - key: CORS_ALLOWED_ORIGINS
+        # Update this to your Vercel frontend URL after deploying the frontend
+        value: https://your-frontend.vercel.app,https://your-frontend.onrender.com
+      - key: NOMINATIM_USER_AGENT
+        value: eld-trip-planner/1.0
+      - key: DATABASE_PATH
+        value: /data/db.sqlite3
+      - key: EXTERNAL_API_TIMEOUT
+        value: "30"
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1
+    healthCheckPath: /api/trip/calculate/
