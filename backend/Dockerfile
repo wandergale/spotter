@@ -19,4 +19,4 @@ RUN python manage.py collectstatic --noinput
 EXPOSE 8000
 
 # Run migrations then start gunicorn
-CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -"]
+CMD ["sh", "-c", "python manage.py migrate --fake-initial --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -"]
