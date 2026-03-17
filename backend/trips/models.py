@@ -1,6 +1,18 @@
 from django.db import models
 
 
+class GeocodingCache(models.Model):
+    """Caches geocoding results to avoid hitting Nominatim rate limits across workers."""
+    query = models.CharField(max_length=500, unique=True, db_index=True)
+    lat = models.FloatField()
+    lon = models.FloatField()
+    display_name = models.CharField(max_length=1000)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.query} → ({self.lat}, {self.lon})"
+
+
 class TripRequest(models.Model):
     """Stores an incoming trip calculation request for optional caching/auditing."""
     current_location = models.CharField(max_length=500)
