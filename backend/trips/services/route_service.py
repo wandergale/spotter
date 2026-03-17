@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import requests
 from django.conf import settings
+from django.db import OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -62,27 +63,62 @@ class RouteService:
     def geocode(self, location: str) -> Coordinates:
         """
         Convert a human-readable location string into lat/lng coordinates.
-        Uses Nominatim (OpenStreetMap).  Raises RouteServiceError on failure.
+        Checks the DB cache first to avoid Nominatim rate limits across workers.
+        Falls back to Nominatim with exponential backoff on 429 errors.
         """
+        from trips.models import GeocodingCache
+
+        cache_key = location.strip().lower()
+
+        # Check DB cache (shared across all Gunicorn workers)
+        try:
+            cached = GeocodingCache.objects.get(query=cache_key)
+            logger.info("Geocoding cache hit for '%s'", location)
+            return Coordinates(
+                lat=cached.lat,
+                lon=cached.lon,
+                display_name=cached.display_name,
+            )
+        except GeocodingCache.DoesNotExist:
+            pass
+        except OperationalError:
+            # Table may not exist yet (first deploy before migrate)
+            logger.warning("GeocodingCache table not available, skipping cache lookup")
+
         params = {
             'q': location,
             'format': 'json',
             'limit': 1,
             'addressdetails': 0,
         }
-        try:
-            resp = requests.get(
-                NOMINATIM_BASE,
-                params=params,
-                headers=self._headers,
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            results = resp.json()
-        except requests.RequestException as exc:
-            raise RouteServiceError(
-                f"Geocoding failed for '{location}': {exc}"
-            ) from exc
+
+        # Retry with exponential backoff: 1s, 2s, 4s
+        last_exc = None
+        for attempt in range(3):
+            if attempt > 0:
+                wait = 2 ** attempt
+                logger.warning("Nominatim 429 for '%s', retrying in %ds (attempt %d/3)", location, wait, attempt + 1)
+                time.sleep(wait)
+            try:
+                resp = requests.get(
+                    NOMINATIM_BASE,
+                    params=params,
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+                if resp.status_code == 429:
+                    last_exc = requests.HTTPError(f"429 Too Many Requests", response=resp)
+                    continue
+                resp.raise_for_status()
+                results = resp.json()
+                break
+            except requests.RequestException as exc:
+                last_exc = exc
+                if hasattr(exc, 'response') and getattr(exc.response, 'status_code', None) == 429:
+                    continue
+                raise RouteServiceError(f"Geocoding failed for '{location}': {exc}") from exc
+        else:
+            raise RouteServiceError(f"Geocoding failed for '{location}': {last_exc}") from last_exc
 
         if not results:
             raise RouteServiceError(
@@ -91,22 +127,51 @@ class RouteService:
             )
 
         best = results[0]
-        return Coordinates(
+        coords = Coordinates(
             lat=float(best['lat']),
             lon=float(best['lon']),
             display_name=best.get('display_name', location),
         )
 
+        # Save to DB cache
+        try:
+            GeocodingCache.objects.get_or_create(
+                query=cache_key,
+                defaults={'lat': coords.lat, 'lon': coords.lon, 'display_name': coords.display_name},
+            )
+        except OperationalError:
+            logger.warning("GeocodingCache table not available, skipping cache write")
+
+        return coords
+
     def geocode_locations(self, *locations: str) -> list[Coordinates]:
         """
-        Geocode multiple location strings, respecting Nominatim's 1 req/sec
-        rate limit by sleeping between requests.
+        Geocode multiple location strings.
+        Cache hits are free; only uncached locations sleep to respect Nominatim's 1 req/sec.
         """
+        from trips.models import GeocodingCache
+
+        # Bulk-check cache for all locations at once
+        cache_keys = [loc.strip().lower() for loc in locations]
+        try:
+            cached_map = {
+                c.query: c for c in GeocodingCache.objects.filter(query__in=cache_keys)
+            }
+        except OperationalError:
+            cached_map = {}
+
         coords = []
-        for i, loc in enumerate(locations):
-            if i > 0:
-                time.sleep(1)  # Nominatim rate limit
-            coords.append(self.geocode(loc))
+        needs_api_call = False
+        for loc, key in zip(locations, cache_keys):
+            if key in cached_map:
+                c = cached_map[key]
+                coords.append(Coordinates(lat=c.lat, lon=c.lon, display_name=c.display_name))
+                logger.info("Geocoding cache hit for '%s'", loc)
+            else:
+                if needs_api_call:
+                    time.sleep(1)  # Nominatim 1 req/sec — only between real API calls
+                coords.append(self.geocode(loc))
+                needs_api_call = True
         return coords
 
     # ── Routing ───────────────────────────────────────────────────────────────
